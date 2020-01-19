@@ -47,7 +47,6 @@ import pysynth as ps
 #     return ctypes.util.find_library(lib)
 # ctypes.util.find_library = proxy_find_library
 
-
 def note_sequence_to_midi_file(sequence, output_file,
                                drop_events_n_seconds_after_last_note=None):
   """Convert NoteSequence to a MIDI file on disk.
@@ -198,9 +197,6 @@ def note_sequence_to_pretty_midi(
 
   return pm
 
-SF2_PATH = 'Yamaha-C5-Salamander-JNv5.1.sf2'
-SAMPLE_RATE = 16000
-
 # Upload a MIDI file and convert to NoteSequence.
 def upload_midi():
   data = list(files.upload().values())
@@ -215,14 +211,70 @@ def decode(ids, encoder):
     ids = ids[:ids.index(text_encoder.EOS_ID)]
   return encoder.decode(ids)
   
+
+def piano_continuation(primer):
+    primer_ns = mm.midi_file_to_note_sequence(primer)
+
+    # Handle sustain pedal in the primer.
+    primer_ns = mm.apply_sustain_control_changes(primer_ns)
+
+    # Trim to desired number of seconds.
+    max_primer_seconds = 20  #@param {type:"slider", min:1, max:120}
+    if primer_ns.total_time > max_primer_seconds:
+        print('Primer is longer than %d seconds, truncating.' % max_primer_seconds)
+        primer_ns = mm.extract_subsequence(
+            primer_ns, 0, max_primer_seconds)
+
+    # Remove drums from primer if present.
+    if any(note.is_drum for note in primer_ns.notes):
+        print('Primer contains drums; they will be removed.')
+        notes = [note for note in primer_ns.notes if not note.is_drum]
+        del primer_ns.notes[:]
+        primer_ns.notes.extend(notes)
+
+    # Set primer instrument and program.
+    for note in primer_ns.notes:
+        note.instrument = 1
+        note.program = 0
+
+    #note_sequence_to_midi_file(primer_ns, 'modified_'+primer)
+
+    targets = unconditional_encoders['targets'].encode_note_sequence(
+    primer_ns)
+
+    # Remove the end token from the encoded primer.
+    targets = targets[:-1]
+
+    decode_length = max(0, 4096 - len(targets))
+    if len(targets) >= 4096:
+        print('Primer has more events than maximum sequence length; nothing will be generated.')
+
+    # Generate sample events.
+    sample_ids = next(unconditional_samples)['outputs']
+
+    # Decode to NoteSequence.
+    midi_filename = decode(
+        sample_ids,
+        encoder=unconditional_encoders['targets'])
+    ns = mm.midi_file_to_note_sequence(midi_filename)
+
+    # Append continuation to primer.
+    continuation_ns = mm.concatenate_sequences([primer_ns, ns])
+
+    note_sequence_to_midi_file(continuation_ns, 'continuated_'+primer)
+
+
+SF2_PATH = 'Yamaha-C5-Salamander-JNv5.1.sf2'
+SAMPLE_RATE = 16000
+
 model_name = 'transformer'
 hparams_set = 'transformer_tpu'
 ckpt_path = './unconditional_model_16.ckpt/unconditional_model_16.ckpt'
 
 class PianoPerformanceLanguageModelProblem(score2perf.Score2PerfProblem):
-  @property
-  def add_eos_symbol(self):
-    return True
+    @property
+    def add_eos_symbol(self):
+        return True
 
 problem = PianoPerformanceLanguageModelProblem()
 unconditional_encoders = problem.get_feature_encoders()
@@ -247,13 +299,13 @@ estimator = trainer_lib.create_estimator(
 # Create input generator (so we can adjust priming and
 # decode length on the fly).
 def input_generator():
-  global targets
-  global decode_length
-  while True:
-    yield {
-        'targets': np.array([targets], dtype=np.int32),
-        'decode_length': np.array(decode_length, dtype=np.int32)
-    }
+    global targets
+    global decode_length
+    while True:
+        yield {
+            'targets': np.array([targets], dtype=np.int32),
+            'decode_length': np.array(decode_length, dtype=np.int32)
+        }
 
 # These values will be changed by subsequent cells.
 targets = []
@@ -265,7 +317,6 @@ unconditional_samples = estimator.predict(input_fn, checkpoint_path=ckpt_path)
 
 # "Burn" one.
 _ = next(unconditional_samples)
-
 
 targets = []
 decode_length = 1024
@@ -281,11 +332,12 @@ unconditional_ns = mm.midi_file_to_note_sequence(midi_filename)
 
 #@title Download Performance as MIDI
 #@markdown Download generated performance as MIDI (optional).
-
 note_sequence_to_midi_file(unconditional_ns, 'unconditional_piano_performance.mid')
 
 
-
+piano_continuation('c_major_arpeggio.mid')
+piano_continuation('c_major_scale.mid')
+piano_continuation('clair_de_lune.mid')
 
 
 
