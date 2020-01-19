@@ -7,8 +7,7 @@ import collections
 import io
 import os
 
-import tensorflow
-import tensorflow.compat.v1 as tf
+import tensorflow as tf
 import magenta
 import magenta.music as mm
 from magenta.music import midi_synth
@@ -30,8 +29,24 @@ from magenta.music.protobuf import generator_pb2
 from magenta.music.protobuf import music_pb2
 from magenta.models.music_vae import configs
 from magenta.models.music_vae.trained_model import TrainedModel
+from magenta.models.score2perf import score2perf
+
+from tensor2tensor import models
+from tensor2tensor import problems
+from tensor2tensor.data_generators import text_encoder
+from tensor2tensor.utils import decoding
+from tensor2tensor.utils import trainer_lib
 
 import pysynth as ps
+
+# import ctypes.util
+# def proxy_find_library(lib):
+#   if lib == 'fluidsynth':
+#     return 'libfluidsynth.so.1'
+#   else:
+#     return ctypes.util.find_library(lib)
+# ctypes.util.find_library = proxy_find_library
+
 
 def note_sequence_to_midi_file(sequence, output_file,
                                drop_events_n_seconds_after_last_note=None):
@@ -183,136 +198,94 @@ def note_sequence_to_pretty_midi(
 
   return pm
 
-print(' * magenta version : ' + magenta.__version__)
-print(' * tensorflow version : ' + tensorflow.__version__)
+SF2_PATH = 'Yamaha-C5-Salamander-JNv5.1.sf2'
+SAMPLE_RATE = 16000
+
+# Upload a MIDI file and convert to NoteSequence.
+def upload_midi():
+  data = list(files.upload().values())
+  if len(data) > 1:
+    print('Multiple files uploaded; using only one.')
+  return mm.midi_to_note_sequence(data[0])
+
+# Decode a list of IDs.
+def decode(ids, encoder):
+  ids = list(ids)
+  if text_encoder.EOS_ID in ids:
+    ids = ids[:ids.index(text_encoder.EOS_ID)]
+  return encoder.decode(ids)
+  
+model_name = 'transformer'
+hparams_set = 'transformer_tpu'
+ckpt_path = './unconditional_model_16.ckpt/unconditional_model_16.ckpt'
+
+class PianoPerformanceLanguageModelProblem(score2perf.Score2PerfProblem):
+  @property
+  def add_eos_symbol(self):
+    return True
+
+problem = PianoPerformanceLanguageModelProblem()
+unconditional_encoders = problem.get_feature_encoders()
+
+# Set up HParams.
+hparams = trainer_lib.create_hparams(hparams_set=hparams_set)
+trainer_lib.add_problem_hparams(hparams, problem)
+hparams.num_hidden_layers = 16
+hparams.sampling_method = 'random'
+
+# Set up decoding HParams.
+decode_hparams = decoding.decode_hparams()
+decode_hparams.alpha = 0.0
+decode_hparams.beam_size = 1
+
+# Create Estimator.
+run_config = trainer_lib.create_run_config(hparams)
+estimator = trainer_lib.create_estimator(
+    model_name, hparams, run_config,
+    decode_hparams=decode_hparams)
+
+# Create input generator (so we can adjust priming and
+# decode length on the fly).
+def input_generator():
+  global targets
+  global decode_length
+  while True:
+    yield {
+        'targets': np.array([targets], dtype=np.int32),
+        'decode_length': np.array(decode_length, dtype=np.int32)
+    }
+
+# These values will be changed by subsequent cells.
+targets = []
+decode_length = 0
+
+# Start the Estimator, loading from the specified checkpoint.
+input_fn = decoding.make_input_fn_from_generator(input_generator())
+unconditional_samples = estimator.predict(input_fn, checkpoint_path=ckpt_path)
+
+# "Burn" one.
+_ = next(unconditional_samples)
 
 
-def melody_rnn(input_sequence):
-  # Initialize the model.
-  print("Initializing Melody RNN...")
-  bundle = sequence_generator_bundle.read_bundle_file('/content/basic_rnn.mag')
-  generator_map = melody_rnn_sequence_generator.get_generator_map()
-  melody_rnn = generator_map['basic_rnn'](checkpoint=None, bundle=bundle)
-  melody_rnn.initialize()
+targets = []
+decode_length = 1024
 
-  # Model options. Change these to get different generated sequences! 
+# Generate sample events.
+sample_ids = next(unconditional_samples)['outputs']
 
-  input_sequence = twinkle_twinkle # change this to teapot if you want
-  num_steps = 128 # change this for shorter or longer sequences
-  temperature = 1.0 # the higher the temperature the more random the sequence.
+# Decode to NoteSequence.
+midi_filename = decode(
+    sample_ids,
+    encoder=unconditional_encoders['targets'])
+unconditional_ns = mm.midi_file_to_note_sequence(midi_filename)
 
-  # Set the start time to begin on the next step after the last note ends.
-  last_end_time = (max(n.end_time for n in input_sequence.notes)
-                    if input_sequence.notes else 0)
-  qpm = input_sequence.tempos[0].qpm 
-  seconds_per_step = 60.0 / qpm / melody_rnn.steps_per_quarter
-  total_seconds = num_steps * seconds_per_step
+#@title Download Performance as MIDI
+#@markdown Download generated performance as MIDI (optional).
 
-  generator_options = generator_pb2.GeneratorOptions()
-  generator_options.args['temperature'].float_value = temperature
-  generate_section = generator_options.generate_sections.add(
-    start_time=last_end_time + seconds_per_step,
-    end_time=total_seconds)
-
-  # Ask the model to continue the sequence.
-  return melody_rnn.generate(input_sequence, generator_options)
-
-def music_vae_sample(model_id, model_config, num):
-  music_vae = TrainedModel(
-        configs.CONFIG_MAP[model_config], 
-        batch_size=4, 
-        checkpoint_dir_or_path=model_id+'.tar')
-
-  generated_sequences = music_vae.sample(n=num, length=80, temperature=1.0)
-
-  cnt=1
-  for ns in generated_sequences:
-    note_sequence_to_midi_file(ns,'vae_sample_'+model_id+'_%d.mid'%(cnt))
-    cnt += 1
-
-def music_vae_interpolate(sequence1, sequence2, model_id, model_config, num):
-  music_vae = TrainedModel(
-      configs.CONFIG_MAP[model_config], 
-      batch_size=4, 
-      checkpoint_dir_or_path=model_id+'.tar')
-
-  note_sequences = music_vae.interpolate(
-        sequence1, sequence2,
-        num_steps=num,
-        length=32)
-
-  # Concatenate them into one long sequence, with the start and 
-  # end sequences at each end. 
-  return mm.sequences_lib.concatenate_sequences(note_sequences)
+note_sequence_to_midi_file(unconditional_ns, 'unconditional_piano_performance.mid')
 
 
-twinkle_twinkle = music_pb2.NoteSequence()
-twinkle_twinkle.notes.add(pitch=60, start_time=0.0, end_time=0.5, velocity=80)
-twinkle_twinkle.notes.add(pitch=60, start_time=0.5, end_time=1.0, velocity=80)
-twinkle_twinkle.notes.add(pitch=67, start_time=1.0, end_time=1.5, velocity=80)
-twinkle_twinkle.notes.add(pitch=67, start_time=1.5, end_time=2.0, velocity=80)
-twinkle_twinkle.notes.add(pitch=69, start_time=2.0, end_time=2.5, velocity=80)
-twinkle_twinkle.notes.add(pitch=69, start_time=2.5, end_time=3.0, velocity=80)
-twinkle_twinkle.notes.add(pitch=67, start_time=3.0, end_time=4.0, velocity=80)
-twinkle_twinkle.notes.add(pitch=65, start_time=4.0, end_time=4.5, velocity=80)
-twinkle_twinkle.notes.add(pitch=65, start_time=4.5, end_time=5.0, velocity=80)
-twinkle_twinkle.notes.add(pitch=64, start_time=5.0, end_time=5.5, velocity=80)
-twinkle_twinkle.notes.add(pitch=64, start_time=5.5, end_time=6.0, velocity=80)
-twinkle_twinkle.notes.add(pitch=62, start_time=6.0, end_time=6.5, velocity=80)
-twinkle_twinkle.notes.add(pitch=62, start_time=6.5, end_time=7.0, velocity=80)
-twinkle_twinkle.notes.add(pitch=60, start_time=7.0, end_time=8.0, velocity=80) 
-twinkle_twinkle.total_time = 8
-twinkle_twinkle.tempos.add(qpm=60)
-note_sequence_to_midi_file(twinkle_twinkle, 'twinkle_twinkle.mid')
 
 
-# teapot = music_pb2.NoteSequence()
-# teapot.notes.add(pitch=69, start_time=0, end_time=0.5, velocity=80)
-# teapot.notes.add(pitch=71, start_time=0.5, end_time=1, velocity=80)
-# teapot.notes.add(pitch=73, start_time=1, end_time=1.5, velocity=80)
-# teapot.notes.add(pitch=74, start_time=1.5, end_time=2, velocity=80)
-# teapot.notes.add(pitch=76, start_time=2, end_time=2.5, velocity=80)
-# teapot.notes.add(pitch=81, start_time=3, end_time=4, velocity=80)
-# teapot.notes.add(pitch=78, start_time=4, end_time=5, velocity=80)
-# teapot.notes.add(pitch=81, start_time=5, end_time=6, velocity=80)
-# teapot.notes.add(pitch=76, start_time=6, end_time=8, velocity=80)
-# teapot.total_time = 8
-# teapot.tempos.add(qpm=60)
-# note_sequence_to_midi_file(teapot, 'teapot.mid')
 
 
-# drums = music_pb2.NoteSequence()
-# drums.notes.add(pitch=36, start_time=0, end_time=0.125, is_drum=True, instrument=10, velocity=80)
-# drums.notes.add(pitch=38, start_time=0, end_time=0.125, is_drum=True, instrument=10, velocity=80)
-# drums.notes.add(pitch=42, start_time=0, end_time=0.125, is_drum=True, instrument=10, velocity=80)
-# drums.notes.add(pitch=46, start_time=0, end_time=0.125, is_drum=True, instrument=10, velocity=80)
-# drums.notes.add(pitch=42, start_time=0.25, end_time=0.375, is_drum=True, instrument=10, velocity=80)
-# drums.notes.add(pitch=42, start_time=0.375, end_time=0.5, is_drum=True, instrument=10, velocity=80)
-# drums.notes.add(pitch=42, start_time=0.5, end_time=0.625, is_drum=True, instrument=10, velocity=80)
-# drums.notes.add(pitch=50, start_time=0.5, end_time=0.625, is_drum=True, instrument=10, velocity=80)
-# drums.notes.add(pitch=36, start_time=0.75, end_time=0.875, is_drum=True, instrument=10, velocity=80)
-# drums.notes.add(pitch=38, start_time=0.75, end_time=0.875, is_drum=True, instrument=10, velocity=80)
-# drums.notes.add(pitch=42, start_time=0.75, end_time=0.875, is_drum=True, instrument=10, velocity=80)
-# drums.notes.add(pitch=45, start_time=0.75, end_time=0.875, is_drum=True, instrument=10, velocity=80)
-# drums.notes.add(pitch=36, start_time=1, end_time=1.125, is_drum=True, instrument=10, velocity=80)
-# drums.notes.add(pitch=42, start_time=1, end_time=1.125, is_drum=True, instrument=10, velocity=80)
-# drums.notes.add(pitch=46, start_time=1, end_time=1.125, is_drum=True, instrument=10, velocity=80)
-# drums.notes.add(pitch=42, start_time=1.25, end_time=1.375, is_drum=True, instrument=10, velocity=80)
-# drums.notes.add(pitch=48, start_time=1.25, end_time=1.375, is_drum=True, instrument=10, velocity=80)
-# drums.notes.add(pitch=50, start_time=1.25, end_time=1.375, is_drum=True, instrument=10, velocity=80)
-# drums.total_time = 1.375
-# drums.tempos.add(qpm=60)
-# note_sequence_to_midi_file(drums, 'drums.mid')
-
-# note_sequence_to_midi_file(melody_rnn(twinkle_twinkle), 'twinkle_melodyRNN.mid')
-# note_sequence_to_midi_file(melody_rnn(teapot), 'teapot_melodyRNN.mid')
-
-
-# music_vae_sample('cat-mel_2bar_big','cat-mel_2bar_big',4)
-# music_vae_sample('hierdec-mel_16bar','hierdec-mel_16bar',6)
-# music_vae_sample('hierdec-trio_16bar','hierdec-trio_16bar',6)
-# music_vae_sample('cat-drums_2bar_small_hikl','cat-drums_2bar_small',4)
-# music_vae_sample('cat-drums_2bar_small_lokl','cat-drums_2bar_small',4)
-# music_vae_sample('groovae_2bar_humanize','groovae_2bar_humanize',4)
-
-# note_sequence_to_midi_file(music_vae_interpolate(twinkle_twinkle, teapot, 'cat-mel_2bar_big','cat-mel_2bar_big',8), 'twinkle_teapot_interpol.mid')
