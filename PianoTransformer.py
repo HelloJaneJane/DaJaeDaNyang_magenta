@@ -39,13 +39,6 @@ from tensor2tensor.utils import trainer_lib
 
 import pysynth as ps
 
-# import ctypes.util
-# def proxy_find_library(lib):
-#   if lib == 'fluidsynth':
-#     return 'libfluidsynth.so.1'
-#   else:
-#     return ctypes.util.find_library(lib)
-# ctypes.util.find_library = proxy_find_library
 
 def note_sequence_to_midi_file(sequence, output_file,
                                drop_events_n_seconds_after_last_note=None):
@@ -197,12 +190,151 @@ def note_sequence_to_pretty_midi(
 
   return pm
 
-# Upload a MIDI file and convert to NoteSequence.
-def upload_midi():
-  data = list(files.upload().values())
-  if len(data) > 1:
-    print('Multiple files uploaded; using only one.')
-  return mm.midi_to_note_sequence(data[0])
+def midi_file_to_note_sequence(midi_file):
+  """Converts MIDI file to a NoteSequence.
+
+  Args:
+    midi_file: A string path to a MIDI file.
+
+  Returns:
+    A NoteSequence.
+
+  Raises:
+    MIDIConversionError: Invalid midi_file.
+  """
+  with tf.gfile.Open(midi_file, 'rb') as f:
+    midi_as_string = f.read()
+    return midi_to_note_sequence(midi_as_string)
+
+def midi_to_note_sequence(midi_data):
+  """Convert MIDI file contents to a NoteSequence.
+
+  Converts a MIDI file encoded as a string into a NoteSequence. Decoding errors
+  are very common when working with large sets of MIDI files, so be sure to
+  handle MIDIConversionError exceptions.
+
+  Args:
+    midi_data: A string containing the contents of a MIDI file or populated
+        pretty_midi.PrettyMIDI object.
+
+  Returns:
+    A NoteSequence.
+
+  Raises:
+    MIDIConversionError: An improper MIDI mode was supplied.
+  """
+  # In practice many MIDI files cannot be decoded with pretty_midi. Catch all
+  # errors here and try to log a meaningful message. So many different
+  # exceptions are raised in pretty_midi.PrettyMidi that it is cumbersome to
+  # catch them all only for the purpose of error logging.
+  # pylint: disable=bare-except
+  if isinstance(midi_data, pretty_midi.PrettyMIDI):
+    midi = midi_data
+  else:
+    try:
+      midi = pretty_midi.PrettyMIDI(six.BytesIO(midi_data))
+    except:
+      raise MIDIConversionError('Midi decoding error %s: %s' %
+                                (sys.exc_info()[0], sys.exc_info()[1]))
+  # pylint: enable=bare-except
+
+  sequence = music_pb2.NoteSequence()
+
+  # Populate header.
+  sequence.ticks_per_quarter = midi.resolution
+  sequence.source_info.parser = music_pb2.NoteSequence.SourceInfo.PRETTY_MIDI
+  sequence.source_info.encoding_type = (
+      music_pb2.NoteSequence.SourceInfo.MIDI)
+
+  # Populate time signatures.
+  for midi_time in midi.time_signature_changes:
+    time_signature = sequence.time_signatures.add()
+    time_signature.time = midi_time.time
+    time_signature.numerator = midi_time.numerator
+    try:
+      # Denominator can be too large for int32.
+      time_signature.denominator = midi_time.denominator
+    except ValueError:
+      raise MIDIConversionError('Invalid time signature denominator %d' %
+                                midi_time.denominator)
+
+  # Populate key signatures.
+  for midi_key in midi.key_signature_changes:
+    key_signature = sequence.key_signatures.add()
+    key_signature.time = midi_key.time
+    key_signature.key = midi_key.key_number % 12
+    midi_mode = midi_key.key_number // 12
+    if midi_mode == 0:
+      key_signature.mode = key_signature.MAJOR
+    elif midi_mode == 1:
+      key_signature.mode = key_signature.MINOR
+    else:
+      raise MIDIConversionError('Invalid midi_mode %i' % midi_mode)
+
+  # Populate tempo changes.
+  tempo_times, tempo_qpms = midi.get_tempo_changes()
+  for time_in_seconds, tempo_in_qpm in zip(tempo_times, tempo_qpms):
+    tempo = sequence.tempos.add()
+    tempo.time = time_in_seconds
+    tempo.qpm = tempo_in_qpm
+
+  # Populate notes by gathering them all from the midi's instruments.
+  # Also set the sequence.total_time as the max end time in the notes.
+  midi_notes = []
+  midi_pitch_bends = []
+  midi_control_changes = []
+  for num_instrument, midi_instrument in enumerate(midi.instruments):
+    # Populate instrument name from the midi's instruments
+    if midi_instrument.name:
+      instrument_info = sequence.instrument_infos.add()
+      instrument_info.name = midi_instrument.name
+      instrument_info.instrument = num_instrument
+    for midi_note in midi_instrument.notes:
+      if not sequence.total_time or midi_note.end > sequence.total_time:
+        sequence.total_time = midi_note.end
+      midi_notes.append((midi_instrument.program, num_instrument,
+                         midi_instrument.is_drum, midi_note))
+    for midi_pitch_bend in midi_instrument.pitch_bends:
+      midi_pitch_bends.append(
+          (midi_instrument.program, num_instrument,
+           midi_instrument.is_drum, midi_pitch_bend))
+    for midi_control_change in midi_instrument.control_changes:
+      midi_control_changes.append(
+          (midi_instrument.program, num_instrument,
+           midi_instrument.is_drum, midi_control_change))
+
+  for program, instrument, is_drum, midi_note in midi_notes:
+    note = sequence.notes.add()
+    note.instrument = instrument
+    note.program = program
+    note.start_time = midi_note.start
+    note.end_time = midi_note.end
+    note.pitch = midi_note.pitch
+    note.velocity = midi_note.velocity
+    note.is_drum = is_drum
+
+  for program, instrument, is_drum, midi_pitch_bend in midi_pitch_bends:
+    pitch_bend = sequence.pitch_bends.add()
+    pitch_bend.instrument = instrument
+    pitch_bend.program = program
+    pitch_bend.time = midi_pitch_bend.time
+    pitch_bend.bend = midi_pitch_bend.pitch
+    pitch_bend.is_drum = is_drum
+
+  for program, instrument, is_drum, midi_control_change in midi_control_changes:
+    control_change = sequence.control_changes.add()
+    control_change.instrument = instrument
+    control_change.program = program
+    control_change.time = midi_control_change.time
+    control_change.control_number = midi_control_change.number
+    control_change.control_value = midi_control_change.value
+    control_change.is_drum = is_drum
+
+  # TODO(douglaseck): Estimate note type (e.g. quarter note) and populate
+  # note.numerator and note.denominator.
+
+  return sequence
+
 
 # Decode a list of IDs.
 def decode(ids, encoder):
@@ -211,8 +343,8 @@ def decode(ids, encoder):
     ids = ids[:ids.index(text_encoder.EOS_ID)]
   return encoder.decode(ids)
   
-
 def piano_continuation(primer):
+    print("이함수도안돌아?")
     primer_ns = mm.midi_file_to_note_sequence(primer)
 
     # Handle sustain pedal in the primer.
@@ -239,7 +371,7 @@ def piano_continuation(primer):
 
     #note_sequence_to_midi_file(primer_ns, 'modified_'+primer)
 
-    targets = unconditional_encoders['targets'].encode_note_sequence(
+    targets = uncondi_encoders['targets'].encode_note_sequence(
     primer_ns)
 
     # Remove the end token from the encoded primer.
@@ -250,12 +382,12 @@ def piano_continuation(primer):
         print('Primer has more events than maximum sequence length; nothing will be generated.')
 
     # Generate sample events.
-    sample_ids = next(unconditional_samples)['outputs']
+    sample_ids = next(uncondi_samples)['outputs']
 
     # Decode to NoteSequence.
     midi_filename = decode(
         sample_ids,
-        encoder=unconditional_encoders['targets'])
+        encoder=uncondi_encoders['targets'])
     ns = mm.midi_file_to_note_sequence(midi_filename)
 
     # Append continuation to primer.
@@ -263,25 +395,62 @@ def piano_continuation(primer):
 
     note_sequence_to_midi_file(continuation_ns, 'continuated_'+primer)
 
+# def piano_accompaniment(melody):
+#     print("?????????????????????????????????")
+#     # Extract melody from user-uploaded MIDI file.
+#     melody_ns = mm.midi_file_to_note_sequence(melody)
+#     #melody_instrument = mm.infer_melody_for_sequence(melody_ns)
+#     notes = [note for note in melody_ns.notes]
+#     #        if note.instrument == melody_instrument]
+#     del melody_ns.notes[:]
+#     melody_ns.notes.extend(
+#         sorted(notes, key=lambda note: note.start_time))
+#     for i in range(len(melody_ns.notes) - 1):
+#         melody_ns.notes[i].end_time = melody_ns.notes[i + 1].start_time
+#     inputs = melody_encoders['inputs'].encode_note_sequence(
+#         melody_ns)
+
+#     # Generate sample events.
+#     decode_length = 4096
+#     sample_ids = next(melody_samples)['outputs']
+
+#     # Decode to NoteSequence.
+#     midi_filename = decode(
+#         sample_ids,
+#         encoder=melody_encoders['targets'])
+#     accompaniment_ns = mm.midi_file_to_note_sequence(midi_filename)
+
+#     note_sequence_to_midi_file(accompaniment_ns, 'accompaniment_'+melody)
+
 
 SF2_PATH = 'Yamaha-C5-Salamander-JNv5.1.sf2'
 SAMPLE_RATE = 16000
 
 model_name = 'transformer'
 hparams_set = 'transformer_tpu'
-ckpt_path = './unconditional_model_16.ckpt/unconditional_model_16.ckpt'
+uncondi_ckpt_path = './unconditional_model_16.ckpt/unconditional_model_16.ckpt'
+# melody_ckpt_path = './melody_conditioned_model_16.ckpt/melody_conditioned_model_16.ckpt'
 
 class PianoPerformanceLanguageModelProblem(score2perf.Score2PerfProblem):
     @property
     def add_eos_symbol(self):
         return True
 
-problem = PianoPerformanceLanguageModelProblem()
-unconditional_encoders = problem.get_feature_encoders()
+# class MelodyToPianoPerformanceProblem(score2perf.AbsoluteMelody2PerfProblem):
+#     @property
+#     def add_eos_symbol(self):
+#         return True
+
+uncondi_problem = PianoPerformanceLanguageModelProblem()
+uncondi_encoders = uncondi_problem.get_feature_encoders()
+
+# melody_problem = MelodyToPianoPerformanceProblem()
+# melody_encoders = melody_problem.get_feature_encoders()
+
 
 # Set up HParams.
 hparams = trainer_lib.create_hparams(hparams_set=hparams_set)
-trainer_lib.add_problem_hparams(hparams, problem)
+trainer_lib.add_problem_hparams(hparams, uncondi_problem)
 hparams.num_hidden_layers = 16
 hparams.sampling_method = 'random'
 
@@ -313,31 +482,125 @@ decode_length = 0
 
 # Start the Estimator, loading from the specified checkpoint.
 input_fn = decoding.make_input_fn_from_generator(input_generator())
-unconditional_samples = estimator.predict(input_fn, checkpoint_path=ckpt_path)
+uncondi_samples = estimator.predict(input_fn, checkpoint_path=uncondi_ckpt_path)
+
 
 # "Burn" one.
-_ = next(unconditional_samples)
-
+_ = next(uncondi_samples)
+print("ㅇㅣ건잘되지않아?")
 targets = []
 decode_length = 1024
 
 # Generate sample events.
-sample_ids = next(unconditional_samples)['outputs']
+sample_ids = next(uncondi_samples)['outputs']
 
 # Decode to NoteSequence.
 midi_filename = decode(
     sample_ids,
-    encoder=unconditional_encoders['targets'])
-unconditional_ns = mm.midi_file_to_note_sequence(midi_filename)
+    encoder=uncondi_encoders['targets'])
+uncondi_ns = mm.midi_file_to_note_sequence(midi_filename)
 
 #@title Download Performance as MIDI
 #@markdown Download generated performance as MIDI (optional).
-note_sequence_to_midi_file(unconditional_ns, 'unconditional_piano_performance.mid')
+note_sequence_to_midi_file(uncondi_ns, 'unconditional_piano_performance.mid')
 
 
 piano_continuation('c_major_arpeggio.mid')
 piano_continuation('c_major_scale.mid')
 piano_continuation('clair_de_lune.mid')
+piano_continuation('fur_elise.mid')
+piano_continuation('moonlight_sonata.mid')
+piano_continuation('prelude_in_c_major.mid')
+piano_continuation('twinkle_twinkle_little_star.mid')
+piano_continuation('mary_had_a_little_lamb.mid')
+
+
+# ###############################################################################################
+# # 멜로디 안돼 안녕
+
+# # @title Setup and Load Checkpoint
+# # @markdown Set up generation from a melody-conditioned
+# # @markdown Transformer model.
+
+# # Set up HParams.
+# hparams = trainer_lib.create_hparams(hparams_set=hparams_set)
+# trainer_lib.add_problem_hparams(hparams, melody_problem)
+# hparams.num_hidden_layers = 16
+# hparams.sampling_method = 'random'
+
+# # Set up decoding HParams.
+# decode_hparams = decoding.decode_hparams()
+# decode_hparams.alpha = 0.0
+# decode_hparams.beam_size = 1
+
+# # Create Estimator.
+# run_config = trainer_lib.create_run_config(hparams)
+# estimator = trainer_lib.create_estimator(
+#     model_name, hparams, run_config,
+#     decode_hparams=decode_hparams)
+
+# # These values will be changed by the following cell.
+# inputs = []
+# decode_length = 0
+
+# print("\n\n\n\n\n\n\n여긴돼?")
+# # Create input generator.
+# def input_generator():
+#   global inputs
+#   while True:
+#     yield {
+#         'inputs': np.array([[inputs]], dtype=np.int32),
+#         'targets': np.zeros([1, 0], dtype=np.int32),
+#         'decode_length': np.array(decode_length, dtype=np.int32)
+#     }
+
+# # Start the Estimator, loading from the specified checkpoint.
+# input_fn = decoding.make_input_fn_from_generator(input_generator())
+# melody_condi_samples = estimator.predict(
+#     input_fn, checkpoint_path=melody_ckpt_path)
+
+# # print(input_fn)
+# if melody_condi_samples == None :
+#     print('???????????????????????????????????????????????????????????????????')
+
+# # for i in melody_condi_samples:
+# #     print (i)
+# # print((melody_condi_samples))
+
+# print("\n\n\n\n\n\n\n왜안찍혀?")
+# # "Burn" one.
+# _ = next(melody_condi_samples)
+# print("\n\n\n\n\n\n\n왜?????????")
+
+# # melody = 'twinkle_twinkle_little_star.mid'
+# # print("?????????????????????????????????")
+# # # Extract melody from user-uploaded MIDI file.
+# # melody_ns = mm.midi_file_to_note_sequence(melody)
+# # #melody_instrument = mm.infer_melody_for_sequence(melody_ns)
+# # notes = [note for note in melody_ns.notes]
+# # #        if note.instrument == melody_instrument]
+# # del melody_ns.notes[:]
+# # melody_ns.notes.extend(
+# #     sorted(notes, key=lambda note: note.start_time))
+# # for i in range(len(melody_ns.notes) - 1):
+# #     melody_ns.notes[i].end_time = melody_ns.notes[i + 1].start_time
+# # inputs = melody_encoders['inputs'].encode_note_sequence(
+# #     melody_ns)
+
+# # # Generate sample events.
+# # decode_length = 4096
+# # sample_ids = next(melody_condi_samples)['outputs']
+
+# # # Decode to NoteSequence.
+# # midi_filename = decode(
+# #     sample_ids,
+# #     encoder=melody_encoders['targets'])
+# # accompaniment_ns = mm.midi_file_to_note_sequence(midi_filename)
+
+# # note_sequence_to_midi_file(accompaniment_ns, 'accompaniment_'+melody)
 
 
 
+# piano_accompaniment('twinkle_twinkle_little_star.mid')
+# piano_accompaniment('mary_had_a_little_lamb.mid')
+# piano_accompaniment('row_row_row_your_boat.mid')
